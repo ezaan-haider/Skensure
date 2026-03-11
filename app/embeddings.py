@@ -6,8 +6,9 @@ embedding_model = HuggingFaceEmbeddings(
 )
 
 
-def embed_text(text: str):
-    return embedding_model.embed_query(text)
+def embed_text_batch(texts: list[str]) -> list[list[float]]:
+    return embedding_model.embed_documents(texts)
 
-vec = embed_text("What is acne?")
-print(len(vec))
+
+def embed_text(text: str) -> list[float]:
+    return embedding_model.embed_query(text)

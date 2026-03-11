@@ -59,3 +59,21 @@ class Document(Base):
     id = Column(Integer, primary_key=True, index=True)
     content = Column(Text, nullable=False)
     embedding = Column(Vector(384))
+
+class ParentDocument(Base):
+    __tablename__ = "parent_documents"
+
+    id = Column(Integer, primary_key=True, index=True)
+    content = Column(Text, nullable=False)
+    source = Column(String)
+    page = Column(Integer)
+
+class ChildChunk(Base):
+    __tablename__ = "child_chunks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    parent_id = Column(Integer, ForeignKey("parent_documents.id"))
+    content = Column(Text, nullable=False)
+    embedding = Column(Vector(384))  # pgvector or similar
+    source = Column(String)
+    page = Column(Integer)

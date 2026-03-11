@@ -1,29 +1,59 @@
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+
 from app.database import SessionLocal
 from app.embeddings import embed_text
 
 
 def retrieve_relevant_chunks(query: str, k: int = 3):
-    db: Session = SessionLocal()
 
-    query_vector = embed_text(query)
+    db: Session = None
 
-    sql = text("""
-        SELECT id, content
-        FROM documents
-        ORDER BY embedding <=> CAST(:query_embedding AS vector)
-        LIMIT :k
-    """)
+    try:
+        db = SessionLocal()
 
-    results = db.execute(
-        sql,
-        {
-            "query_embedding": query_vector,
-            "k": k
-        }
-    ).fetchall()
+        # Embed the user query
+        query_vector = embed_text(query)
 
-    db.close()
+        # Search CHILD chunks but return PARENT documents
+        sql = text("""
+            SELECT
+                p.id AS parent_id,
+                p.content AS parent_content,
+                c.content AS child_content,
+                p.source,
+                p.page
+            FROM child_chunks c
+            JOIN parent_documents p
+                ON c.parent_id = p.id
+            ORDER BY c.embedding <=> CAST(:query_embedding AS vector)
+            LIMIT :k
+        """)
 
-    return [row.content for row in results]
+        results = db.execute(
+            sql,
+            {
+                "query_embedding": query_vector,
+                "k": k
+            }
+        ).fetchall()
+
+        # Return parent context
+        contexts = []
+
+        for row in results:
+            contexts.append({
+                "content": row.parent_content,
+                "source": row.source,
+                "page": row.page
+            })
+
+        return contexts
+
+    except Exception as e:
+        print("Retrieval error:", str(e))
+        return []
+
+    finally:
+        if db:
+            db.close()

@@ -10,6 +10,13 @@ from vision.inference import predict_image
 from app.llm import generate_reply
 from app.retriever import retrieve_relevant_chunks
 
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+print("TOKEN:", os.getenv("HUGGINGFACEHUB_API_TOKEN"))
+
 
 app = FastAPI()
 
@@ -162,7 +169,13 @@ def create_chat(
     # 🔎 Retrieve relevant medical knowledge
     retrieved_chunks = retrieve_relevant_chunks(message, k=3)
 
-    knowledge_context = "\n\n".join(retrieved_chunks)
+    if not retrieved_chunks:
+        knowledge_context = "No medical knowledge was retrieved."
+    else:
+        knowledge_context = "\n\n".join(
+            f"Source: {chunk['source']} (page {chunk['page']})\n{chunk['content']}"
+            for chunk in retrieved_chunks
+        )
 
     # 4️⃣ Convert to message format
     messages = [
@@ -170,7 +183,9 @@ def create_chat(
         "role": "system",
         "content": (
             "You are Skensure, an AI dermatology educational assistant.\n\n"
-            "Use ONLY the medical knowledge provided below to answer.\n"
+            "Use ONLY the medical knowledge provided below to answer the user.\n"
+            "If the information is not present in the knowledge, say you do not know.\n"
+            "Do not invent medical facts.\n"
             "If the answer is not in the provided knowledge, say you are unsure.\n"
             "Do NOT provide prescriptions or definitive diagnoses.\n"
             "Encourage consulting a licensed dermatologist.\n\n"
@@ -205,7 +220,8 @@ def create_chat(
 
     # 7️⃣ Return reply
     return {
-        "reply": assistant_reply
+        "reply": assistant_reply,
+        "sources": retrieved_chunks
     }
 
 @app.get("/chat-history/{user_id}")
