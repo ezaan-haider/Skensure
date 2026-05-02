@@ -7,18 +7,40 @@ from fastapi import File, UploadFile
 import shutil
 import os
 from vision.inference import predict_image
-from app.llm import generate_reply
 from app.retriever import retrieve_relevant_chunks
-
+from app.langgraph import chat_graph
 from dotenv import load_dotenv
 import os
+from uuid import uuid4
+from pathlib import Path
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from fastapi import Request
+from fastapi.responses import JSONResponse
+import logging
 
 load_dotenv()
 
-print("TOKEN:", os.getenv("HUGGINGFACEHUB_API_TOKEN"))
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("skensure")
 
+logger.info("Hugging Face token loaded: %s", bool(os.getenv("HUGGINGFACEHUB_API_TOKEN")))
 
 app = FastAPI()
+
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
+
+
+@app.exception_handler(RateLimitExceeded)
+def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "Too many requests. Please try again shortly."}
+    )
 
 # Create tables
 Base.metadata.create_all(bind=engine)
@@ -75,27 +97,31 @@ def login(email: str, password: str, db: Session = Depends(get_db)):
     return {"message": "Login successful"}
 
 @app.post("/upload-image")
+@limiter.limit("10/minute")
 def upload_image(
+    request: Request,
     user_id: int,
     file: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
-    # Check if user exists
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Create uploads folder path
+    ext = Path(file.filename).suffix.lower()
+
+    if ext not in [".jpg", ".jpeg", ".png"]:
+        raise HTTPException(status_code=400, detail="Only JPG and PNG images are allowed")
+
     upload_dir = "uploads"
     os.makedirs(upload_dir, exist_ok=True)
 
-    # Save file
-    file_path = os.path.join(upload_dir, file.filename)
+    safe_filename = f"{uuid4()}{ext}"
+    file_path = os.path.join(upload_dir, safe_filename)
 
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    # Create image record
     new_image = models.Image(
         user_id=user_id,
         image_path=file_path
@@ -132,97 +158,119 @@ def predict(image_id: int, db: Session = Depends(get_db)):
         "confidence": confidence
     }
 
+@app.post("/create-session")
+def create_session(user_id: int, db: Session = Depends(get_db)):
+    session = models.ChatSession(user_id=user_id)
+
+    db.add(session)
+    db.commit()
+    db.refresh(session)
+
+    return {
+        "session_id": session.id
+    }
+
+@app.get("/sessions/{user_id}")
+def get_sessions(user_id: int, db: Session = Depends(get_db)):
+    sessions = db.query(models.ChatSession).filter(
+        models.ChatSession.user_id == user_id
+    ).order_by(models.ChatSession.created_at.desc()).all()
+
+    return [
+        {
+            "session_id": s.id,
+            "title": s.title,
+            "created_at": s.created_at
+        }
+        for s in sessions
+    ]
+
+@app.put("/session/{session_id}/rename")
+def rename_session(session_id: int, title: str, db: Session = Depends(get_db)):
+    session = db.query(models.ChatSession).filter(
+        models.ChatSession.id == session_id
+    ).first()
+
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session.title = title
+    db.commit()
+
+    return {"message": "Session renamed"}
+
+@app.get("/session/{session_id}/messages")
+def get_session_messages(session_id: int, db: Session = Depends(get_db)):
+    chats = db.query(models.Chat).filter(
+        models.Chat.session_id == session_id
+    ).order_by(models.Chat.created_at).all()
+
+    return chats
 
 @app.post("/chat")
+@limiter.limit("20/minute")
 def create_chat(
+    request: Request,
     user_id: int,
+    session_id: int,
     message: str,
     image_id: int = None,
     db: Session = Depends(get_db)
 ):
-    # 1️⃣ Check user exists
-    user = db.query(models.User).filter(models.User.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    if not message or len(message.strip()) == 0:
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
 
-    # 2️⃣ Store user message
-    user_chat = models.Chat(
-        user_id=user_id,
-        image_id=image_id,
-        role="user",
-        message=message
-    )
-    db.add(user_chat)
-    db.commit()
+    if len(message) > 2000:
+        raise HTTPException(status_code=400, detail="Message is too long")
 
-    # 3️⃣ Fetch last 8 messages for context
-    recent_chats = (
-        db.query(models.Chat)
-        .filter(models.Chat.user_id == user_id)
-        .order_by(models.Chat.created_at.desc())
-        .limit(8)
-        .all()
-    )
+    session = db.query(models.ChatSession).filter(
+        models.ChatSession.id == session_id,
+        models.ChatSession.user_id == user_id
+    ).first()
 
-    recent_chats = list(reversed(recent_chats))
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found for this user")
 
-    # 🔎 Retrieve relevant medical knowledge
-    retrieved_chunks = retrieve_relevant_chunks(message, k=3)
+    if image_id is not None:
+        image = db.query(models.Image).filter(
+            models.Image.id == image_id,
+            models.Image.user_id == user_id
+        ).first()
 
-    if not retrieved_chunks:
-        knowledge_context = "No medical knowledge was retrieved."
-    else:
-        knowledge_context = "\n\n".join(
-            f"Source: {chunk['source']} (page {chunk['page']})\n{chunk['content']}"
-            for chunk in retrieved_chunks
-        )
+        if not image:
+            raise HTTPException(status_code=404, detail="Image not found for this user")
 
-    # 4️⃣ Convert to message format
-    messages = [
-    {
-        "role": "system",
-        "content": (
-            "You are Skensure, an AI dermatology educational assistant.\n\n"
-            "Use ONLY the medical knowledge provided below to answer the user.\n"
-            "If the information is not present in the knowledge, say you do not know.\n"
-            "Do not invent medical facts.\n"
-            "If the answer is not in the provided knowledge, say you are unsure.\n"
-            "Do NOT provide prescriptions or definitive diagnoses.\n"
-            "Encourage consulting a licensed dermatologist.\n\n"
-            "Medical Knowledge:\n"
-            f"{knowledge_context}"
-        )
-    }
-]
+    result = chat_graph.invoke({
+        "user_id": user_id,
+        "session_id": session_id,
+        "message": message.strip(),
+        "image_id": image_id
+    })
 
-    for chat in recent_chats:
-        messages.append({
-            "role": chat.role,
-            "content": chat.message
-        })
-
-    print("==== MESSAGES SENT TO LLM ====")
-    for m in messages:
-        print(m)
-
-    # 5️⃣ Call LLM
-    assistant_reply = generate_reply(messages)
-
-    # 6️⃣ Store assistant reply
-    assistant_chat = models.Chat(
-        user_id=user_id,
-        image_id=image_id,
-        role="assistant",
-        message=assistant_reply
-    )
-    db.add(assistant_chat)
-    db.commit()
-
-    # 7️⃣ Return reply
     return {
-        "reply": assistant_reply,
-        "sources": retrieved_chunks
+        "prediction_info": result.get("prediction_info"),
+        "reply": result.get("reply"),
+        "sources": result.get("retrieved_chunks")
     }
+
+@app.delete("/session/{session_id}")
+def delete_session(session_id: int, db: Session = Depends(get_db)):
+    session = db.query(models.ChatSession).filter(
+        models.ChatSession.id == session_id
+    ).first()
+
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # delete chats first (important)
+    db.query(models.Chat).filter(
+        models.Chat.session_id == session_id
+    ).delete()
+
+    db.delete(session)
+    db.commit()
+
+    return {"message": "Session deleted"}
 
 @app.get("/chat-history/{user_id}")
 def get_chat_history(user_id: int, image_id: int = None, db: Session = Depends(get_db)):
